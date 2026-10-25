@@ -49,7 +49,7 @@ import {
 
 import styles from "./EmbroideryEditor.module.css";
 
-type SymbolKey = "a" | "b" | "c" | "d" | "e" | "f" | "g";
+type SymbolKey = string;
 type Tool = "pan" | "brush" | "area" | "fill" | "picker";
 type ViewMode = "edit" | "stitch";
 
@@ -79,7 +79,13 @@ type ImportedProject = {
   width?: number;
   height?: number;
   rows?: unknown;
-  palette?: Array<{ symbol?: string; color?: string }>;
+  palette?: Array<{
+    symbol?: string;
+    color?: string;
+    dmc?: string;
+    name?: string;
+    textColor?: string;
+  }>;
   completed?: unknown;
 };
 type RestoredProject = {
@@ -119,8 +125,12 @@ declare global {
 }
 
 const pattern = patternJson as PatternData;
-const symbols = pattern.palette.map((item) => item.symbol);
-const symbolToIndex = new Map(symbols.map((symbol, index) => [symbol, index]));
+const initialSymbols = pattern.palette.map((item) => item.symbol);
+const initialSymbolToIndex = new Map(
+  initialSymbols.map((symbol, index) => [symbol, index]),
+);
+const paletteSymbolPool =
+  "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
 const storageKey = "stitch-studio-project-v6";
 const googleClientIdStorageKey = "stitch-studio-google-client-id";
 const defaultGoogleClientId =
@@ -130,14 +140,84 @@ const defaultGoogleClientId =
 function buildInitialCells() {
   return Uint8Array.from(
     pattern.rows.join(""),
-    (symbol) => symbolToIndex.get(symbol as SymbolKey) ?? 0,
+    (symbol) => initialSymbolToIndex.get(symbol as SymbolKey) ?? 0,
   );
 }
 
-function encodeCells(cells: Uint8Array) {
+function encodeCells(cells: Uint8Array, palette: PaletteItem[]) {
   let value = "";
-  for (const cell of cells) value += symbols[cell];
+  for (const cell of cells) value += palette[cell]?.symbol ?? palette[0].symbol;
   return value;
+}
+
+function getTextColor(color: string) {
+  const red = Number.parseInt(color.slice(1, 3), 16);
+  const green = Number.parseInt(color.slice(3, 5), 16);
+  const blue = Number.parseInt(color.slice(5, 7), 16);
+  const luminance = (red * 299 + green * 587 + blue * 114) / 1000;
+  return luminance > 150 ? "#17312F" : "#FFFFFF";
+}
+
+function buildPalette(savedPalette?: ImportedProject["palette"]) {
+  const savedBySymbol = new Map(
+    (savedPalette ?? [])
+      .filter(
+        (item) =>
+          typeof item.symbol === "string" &&
+          item.symbol.length === 1 &&
+          typeof item.color === "string" &&
+          /^#[0-9a-f]{6}$/i.test(item.color),
+      )
+      .map((item) => [item.symbol as string, item]),
+  );
+
+  const nextPalette = pattern.palette.map((item) => {
+    const saved = savedBySymbol.get(item.symbol);
+    if (!saved?.color) return { ...item };
+    const color = saved.color.toUpperCase();
+    return {
+      ...item,
+      color,
+      textColor:
+        saved.textColor && /^#[0-9a-f]{6}$/i.test(saved.textColor)
+          ? saved.textColor.toUpperCase()
+          : getTextColor(color),
+    };
+  });
+
+  for (const saved of savedPalette ?? []) {
+    if (
+      typeof saved.symbol !== "string" ||
+      saved.symbol.length !== 1 ||
+      initialSymbolToIndex.has(saved.symbol) ||
+      nextPalette.some((item) => item.symbol === saved.symbol) ||
+      typeof saved.color !== "string" ||
+      !/^#[0-9a-f]{6}$/i.test(saved.color)
+    ) {
+      continue;
+    }
+    const color = saved.color.toUpperCase();
+    nextPalette.push({
+      symbol: saved.symbol,
+      dmc: typeof saved.dmc === "string" ? saved.dmc.slice(0, 18) : "",
+      name:
+        typeof saved.name === "string" && saved.name.trim()
+          ? saved.name.trim().slice(0, 40)
+          : "Свой цвет",
+      color,
+      textColor:
+        saved.textColor && /^#[0-9a-f]{6}$/i.test(saved.textColor)
+          ? saved.textColor.toUpperCase()
+          : getTextColor(color),
+      count: 0,
+    });
+  }
+
+  return nextPalette.slice(0, 255);
+}
+
+function getPaletteLabel(item: PaletteItem) {
+  return item.dmc ? `DMC ${item.dmc}` : "Свой цвет";
 }
 
 function downloadBlob(filename: string, blob: Blob) {
@@ -196,7 +276,11 @@ function restoreImportedProject(
   }
 
   const encoded = (imported.rows as string[]).join("");
-  if ([...encoded].some((symbol) => !symbolToIndex.has(symbol as SymbolKey))) {
+  const nextPalette = buildPalette(imported.palette);
+  const symbolToIndex = new Map(
+    nextPalette.map((item, index) => [item.symbol, index]),
+  );
+  if ([...encoded].some((symbol) => !symbolToIndex.has(symbol))) {
     throw new Error("В схеме есть неизвестные обозначения цветов.");
   }
 
@@ -215,7 +299,7 @@ function restoreImportedProject(
 
   const nextCells = Uint8Array.from(
     encoded,
-    (symbol) => symbolToIndex.get(symbol as SymbolKey) ?? 0,
+    (symbol) => symbolToIndex.get(symbol) ?? 0,
   );
   const nextDone = new Uint8Array(pattern.width * pattern.height);
   if (Array.isArray(imported.completed)) {
@@ -223,14 +307,6 @@ function restoreImportedProject(
       nextDone[index as number] = 1;
     });
   }
-  const nextPalette = pattern.palette.map((item) => {
-    const saved = imported.palette?.find((entry) => entry.symbol === item.symbol);
-    const color = saved?.color;
-    return color && /^#[0-9a-f]{6}$/i.test(color)
-      ? { ...item, color: color.toUpperCase() }
-      : { ...item };
-  });
-
   return {
     filename,
     cells: nextCells,
@@ -270,6 +346,10 @@ export default function EmbroideryEditor() {
   const [palette, setPalette] = useState<PaletteItem[]>(() =>
     pattern.palette.map((item) => ({ ...item })),
   );
+  const [addColorDialogOpen, setAddColorDialogOpen] = useState(false);
+  const [newColorName, setNewColorName] = useState("Свой цвет");
+  const [newColorDmc, setNewColorDmc] = useState("");
+  const [newColorValue, setNewColorValue] = useState("#4B1D68");
   const [selectedSymbol, setSelectedSymbol] = useState(1);
   const selectedSymbolRef = useRef(selectedSymbol);
   const [tool, setTool] = useState<Tool>("pan");
@@ -625,12 +705,36 @@ export default function EmbroideryEditor() {
         const saved = JSON.parse(raw) as {
           cells?: string;
           done?: string;
-          palette?: string[];
+          palette?: string[] | ImportedProject["palette"];
         };
+        let restoredPalette = pattern.palette.map((item) => ({ ...item }));
+        if (
+          Array.isArray(saved.palette) &&
+          saved.palette.length === pattern.palette.length &&
+          saved.palette.every((color) => typeof color === "string")
+        ) {
+          restoredPalette = restoredPalette.map((item, index) => {
+            const color = (saved.palette as string[])[index];
+            return /^#[0-9a-f]{6}$/i.test(color)
+              ? {
+                  ...item,
+                  color: color.toUpperCase(),
+                  textColor: getTextColor(color),
+                }
+              : item;
+          });
+        } else if (Array.isArray(saved.palette)) {
+          restoredPalette = buildPalette(
+            saved.palette as ImportedProject["palette"],
+          );
+        }
         if (saved.cells?.length === pattern.width * pattern.height) {
+          const savedSymbolToIndex = new Map(
+            restoredPalette.map((item, index) => [item.symbol, index]),
+          );
           const restoredCells = Uint8Array.from(
             saved.cells,
-            (symbol) => symbolToIndex.get(symbol as SymbolKey) ?? 0,
+            (symbol) => savedSymbolToIndex.get(symbol) ?? 0,
           );
           cellsRef.current = restoredCells;
           setCells(restoredCells);
@@ -642,11 +746,10 @@ export default function EmbroideryEditor() {
           doneRef.current = restoredDone;
           setDone(restoredDone);
         }
-        if (saved.palette?.length === pattern.palette.length) {
-          setPalette((current) =>
-            current.map((item, index) => ({ ...item, color: saved.palette![index] })),
-          );
-        }
+        setPalette(restoredPalette);
+        setVisibleSymbols(
+          new Set(restoredPalette.map((_, index) => index)),
+        );
       } catch {
         window.localStorage.removeItem(storageKey);
       } finally {
@@ -662,9 +765,10 @@ export default function EmbroideryEditor() {
       window.localStorage.setItem(
         storageKey,
         JSON.stringify({
-          cells: encodeCells(cells),
+          version: 2,
+          cells: encodeCells(cells, palette),
           done: Array.from(done).join(""),
-          palette: palette.map((item) => item.color),
+          palette,
         }),
       );
       setSaveLabel("Сохранено локально");
@@ -673,10 +777,10 @@ export default function EmbroideryEditor() {
   }, [cells, done, hydrated, palette]);
 
   const counts = useMemo(() => {
-    const result = new Array(pattern.palette.length).fill(0) as number[];
+    const result = new Array(palette.length).fill(0) as number[];
     for (const cell of cells) result[cell] += 1;
     return result;
-  }, [cells]);
+  }, [cells, palette.length]);
 
   const completed = useMemo(() => {
     let value = 0;
@@ -685,13 +789,13 @@ export default function EmbroideryEditor() {
   }, [done]);
 
   const serializeProject = useCallback(() => {
-    const encoded = encodeCells(cellsRef.current);
+    const encoded = encodeCells(cellsRef.current, palette);
     const rows = Array.from({ length: pattern.height }, (_, row) =>
       encoded.slice(row * pattern.width, (row + 1) * pattern.width),
     );
     return JSON.stringify(
       {
-        version: 1,
+        version: 2,
         title: pattern.title,
         width: pattern.width,
         height: pattern.height,
@@ -1171,6 +1275,42 @@ export default function EmbroideryEditor() {
     });
   };
 
+  const openAddColorDialog = () => {
+    setNewColorName("Свой цвет");
+    setNewColorDmc("");
+    setNewColorValue("#4B1D68");
+    setAddColorDialogOpen(true);
+  };
+
+  const addCustomColor = () => {
+    const symbol = [...paletteSymbolPool].find(
+      (candidate) => !palette.some((item) => item.symbol === candidate),
+    );
+    if (!symbol) {
+      window.alert("Достигнут предел количества цветов в одной схеме.");
+      return;
+    }
+
+    const color = newColorValue.toUpperCase();
+    const name = newColorName.trim() || "Свой цвет";
+    const nextIndex = palette.length;
+    const item: PaletteItem = {
+      symbol,
+      dmc: newColorDmc.trim().slice(0, 18),
+      name: name.slice(0, 40),
+      color,
+      textColor: getTextColor(color),
+      count: 0,
+    };
+
+    setPalette((current) => [...current, item]);
+    setVisibleSymbols((current) => new Set(current).add(nextIndex));
+    selectSymbol(nextIndex);
+    setTool("brush");
+    setAddColorDialogOpen(false);
+    setSaveLabel("Сохраняю…");
+  };
+
   const resetProject = () => {
     if (!window.confirm("Вернуть исходную схему и цвета? Все ваши изменения будут удалены.")) return;
     cellsRef.current = buildInitialCells();
@@ -1181,6 +1321,9 @@ export default function EmbroideryEditor() {
     redoStack.current = [];
     setHistoryCounts({ undo: 0, redo: 0 });
     setPalette(pattern.palette.map((item) => ({ ...item })));
+    setVisibleSymbols(new Set(pattern.palette.map((_, index) => index)));
+    selectSymbol(1);
+    setAddColorDialogOpen(false);
     window.localStorage.removeItem(storageKey);
     setSaveLabel("Исходная схема восстановлена");
     fitEditor();
@@ -1216,7 +1359,10 @@ export default function EmbroideryEditor() {
     setCells(pendingImport.cells);
     setDone(pendingImport.done);
     setPalette(pendingImport.palette);
-    setVisibleSymbols(new Set(pattern.palette.map((_, index) => index)));
+    setVisibleSymbols(
+      new Set(pendingImport.palette.map((_, index) => index)),
+    );
+    selectSymbol(Math.min(1, pendingImport.palette.length - 1));
     undoStack.current = [];
     redoStack.current = [];
     setHistoryCounts({ undo: 0, redo: 0 });
@@ -1277,7 +1423,7 @@ export default function EmbroideryEditor() {
           <span className={styles.documentIcon} aria-hidden="true"><Sparkles /></span>
           <span>
             <strong>{pattern.title}</strong>
-            <small>{pattern.width} × {pattern.height} крестиков · {pattern.palette.length} цветов</small>
+            <small>{pattern.width} × {pattern.height} крестиков · {palette.length} цветов</small>
           </span>
         </div>
 
@@ -1412,7 +1558,7 @@ export default function EmbroideryEditor() {
           <footer className={styles.editorFooter}>
             <span><i className={styles.footerDotActive} /> рамка видимой области на карте</span>
             <span><i className={styles.footerDotGrid} /> линии каждые 10 крестиков</span>
-            <strong>{viewMode === "edit" ? `Активный цвет: ${palette[selectedSymbol].symbol} · DMC ${palette[selectedSymbol].dmc}` : `${completed} крестиков отмечено`}</strong>
+            <strong>{viewMode === "edit" ? `Активный цвет: ${palette[selectedSymbol].symbol} · ${getPaletteLabel(palette[selectedSymbol])}` : `${completed} крестиков отмечено`}</strong>
           </footer>
         </section>
 
@@ -1429,7 +1575,7 @@ export default function EmbroideryEditor() {
                 <div className={`${styles.paletteRow} ${selectedSymbol === index ? styles.paletteSelected : ""}`} key={item.symbol}>
                   <button className={styles.paletteMain} onClick={() => selectSymbol(index)} type="button">
                     <span className={styles.swatch} style={{ background: item.color, color: item.textColor }}>{item.symbol}</span>
-                    <span className={styles.paletteCopy}><strong>{item.name}</strong><small>DMC {item.dmc} · {counts[index].toLocaleString("ru-RU")}</small></span>
+                    <span className={styles.paletteCopy}><strong>{item.name}</strong><small>{getPaletteLabel(item)} · {counts[index].toLocaleString("ru-RU")}</small></span>
                     {selectedSymbol === index && <Check className={styles.selectedCheck} />}
                   </button>
                   <label className={styles.colorPicker} title="Изменить цвет">
@@ -1438,7 +1584,7 @@ export default function EmbroideryEditor() {
                       value={item.color}
                       onChange={(event) => {
                         const color = event.target.value.toUpperCase();
-                        setPalette((current) => current.map((entry, itemIndex) => itemIndex === index ? { ...entry, color } : entry));
+                        setPalette((current) => current.map((entry, itemIndex) => itemIndex === index ? { ...entry, color, textColor: getTextColor(color) } : entry));
                         setSaveLabel("Сохраняю…");
                       }}
                       aria-label={`Изменить цвет ${item.name}`}
@@ -1453,12 +1599,97 @@ export default function EmbroideryEditor() {
             })}
           </div>
 
+          <button
+            className={styles.addColorButton}
+            onClick={openAddColorDialog}
+            type="button"
+          >
+            <Plus /> Добавить свой цвет
+          </button>
+
           <div className={styles.paletteTip}>
             <span><Brush /></span>
             <p><strong>Цвет редактируется</strong><small>Нажмите на пипетку справа и выберите новый оттенок — он обновится во всей схеме.</small></p>
           </div>
         </aside>
       </div>
+
+      {addColorDialogOpen && (
+        <div className={styles.importOverlay}>
+          <section
+            className={styles.colorDialog}
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="add-color-title"
+          >
+            <header className={styles.colorDialogHeader}>
+              <span
+                className={styles.colorDialogSwatch}
+                style={{
+                  background: newColorValue,
+                  color: getTextColor(newColorValue),
+                }}
+                aria-hidden="true"
+              >
+                {[...paletteSymbolPool].find(
+                  (candidate) =>
+                    !palette.some((item) => item.symbol === candidate),
+                ) ?? "?"}
+              </span>
+              <div>
+                <small>Новый материал</small>
+                <h2 id="add-color-title">Добавить свой цвет</h2>
+                <p>Он появится в палитре и будет доступен для всех инструментов.</p>
+              </div>
+            </header>
+
+            <div className={styles.colorDialogFields}>
+              <label>
+                <span>Название</span>
+                <input
+                  autoFocus
+                  maxLength={40}
+                  value={newColorName}
+                  onChange={(event) => setNewColorName(event.target.value)}
+                  placeholder="Например, тёмно-фиолетовый"
+                />
+              </label>
+              <label>
+                <span>Номер DMC <small>необязательно</small></span>
+                <input
+                  maxLength={18}
+                  value={newColorDmc}
+                  onChange={(event) => setNewColorDmc(event.target.value)}
+                  placeholder="Например, 550"
+                />
+              </label>
+              <label className={styles.newColorPicker}>
+                <span>Оттенок</span>
+                <span>
+                  <input
+                    type="color"
+                    value={newColorValue}
+                    onChange={(event) =>
+                      setNewColorValue(event.target.value.toUpperCase())
+                    }
+                    aria-label="Оттенок нового цвета"
+                  />
+                  <strong>{newColorValue.toUpperCase()}</strong>
+                </span>
+              </label>
+            </div>
+
+            <div className={styles.colorDialogActions}>
+              <button onClick={() => setAddColorDialogOpen(false)} type="button">
+                Отмена
+              </button>
+              <button onClick={addCustomColor} type="button">
+                <Plus /> Добавить цвет
+              </button>
+            </div>
+          </section>
+        </div>
+      )}
 
       {pendingImport && (
         <div className={styles.importOverlay}>

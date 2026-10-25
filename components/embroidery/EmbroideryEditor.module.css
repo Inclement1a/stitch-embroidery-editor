@@ -896,6 +896,34 @@
   gap: .42rem;
 }
 
+.addColorButton {
+  display: flex;
+  width: 100%;
+  min-height: 42px;
+  align-items: center;
+  justify-content: center;
+  gap: .45rem;
+  margin-top: .65rem;
+  border: 1px dashed #d5b8a8;
+  border-radius: 11px;
+  background: #fff8f3;
+  color: var(--coral);
+  font-size: 9px;
+  font-weight: 850;
+  cursor: pointer;
+  transition: .15s ease;
+}
+
+.addColorButton:hover {
+  border-color: var(--coral);
+  background: var(--coral-soft);
+  transform: translateY(-1px);
+}
+
+.addColorButton svg {
+  width: 14px;
+}
+
 .paletteRow {
   display: grid;
   min-width: 0;
@@ -1052,6 +1080,162 @@
   place-items: center;
   background: rgb(15 42 40 / 58%);
   backdrop-filter: blur(7px);
+}
+
+.colorDialog {
+  display: grid;
+  width: min(100%, 460px);
+  gap: 1.15rem;
+  border: 1px solid rgb(255 255 255 / 42%);
+  border-radius: 20px;
+  padding: 1.25rem;
+  background: var(--card);
+  box-shadow: 0 30px 80px rgb(9 31 29 / 30%);
+}
+
+.colorDialogHeader {
+  display: grid;
+  grid-template-columns: 58px 1fr;
+  gap: .9rem;
+  align-items: center;
+}
+
+.colorDialogHeader h2,
+.colorDialogHeader p {
+  margin: 0;
+}
+
+.colorDialogHeader small {
+  color: var(--coral);
+  font-size: 8px;
+  font-weight: 850;
+  letter-spacing: .12em;
+  text-transform: uppercase;
+}
+
+.colorDialogHeader h2 {
+  margin-top: .15rem;
+  color: var(--forest);
+  font-size: 18px;
+}
+
+.colorDialogHeader p {
+  margin-top: .3rem;
+  color: #788480;
+  font-size: 9px;
+  line-height: 1.45;
+}
+
+.colorDialogSwatch {
+  display: grid;
+  width: 58px;
+  height: 58px;
+  place-items: center;
+  border: 1px solid rgb(19 53 50 / 16%);
+  border-radius: 16px;
+  box-shadow: inset 0 0 0 2px rgb(255 255 255 / 18%);
+  font-size: 20px;
+  font-weight: 900;
+}
+
+.colorDialogFields {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: .75rem;
+}
+
+.colorDialogFields label {
+  display: grid;
+  gap: .35rem;
+  color: var(--forest);
+  font-size: 9px;
+  font-weight: 800;
+}
+
+.colorDialogFields label:first-child,
+.newColorPicker {
+  grid-column: 1 / -1;
+}
+
+.colorDialogFields label > span small {
+  color: #9aa29f;
+  font-size: 7px;
+  font-weight: 600;
+}
+
+.colorDialogFields input:not([type="color"]) {
+  min-width: 0;
+  height: 40px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 0 .75rem;
+  outline: none;
+  background: white;
+  color: var(--ink);
+  font: inherit;
+}
+
+.colorDialogFields input:not([type="color"]):focus {
+  border-color: #efad9e;
+  box-shadow: 0 0 0 3px rgb(239 109 80 / 9%);
+}
+
+.newColorPicker > span:last-child {
+  display: flex;
+  min-height: 42px;
+  align-items: center;
+  gap: .7rem;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 5px .75rem 5px 5px;
+  background: white;
+}
+
+.newColorPicker input[type="color"] {
+  width: 52px;
+  height: 32px;
+  border: 0;
+  padding: 0;
+  background: transparent;
+  cursor: pointer;
+}
+
+.newColorPicker strong {
+  color: var(--ink);
+  font-size: 10px;
+  letter-spacing: .05em;
+}
+
+.colorDialogActions {
+  display: flex;
+  justify-content: flex-end;
+  gap: .55rem;
+}
+
+.colorDialogActions button {
+  display: inline-flex;
+  min-height: 38px;
+  align-items: center;
+  justify-content: center;
+  gap: .4rem;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 0 .9rem;
+  background: white;
+  color: #6f7d79;
+  font-size: 9px;
+  font-weight: 800;
+  cursor: pointer;
+}
+
+.colorDialogActions button:last-child {
+  border-color: var(--coral);
+  background: var(--coral);
+  color: white;
+}
+
+.colorDialogActions svg {
+  width: 14px;
 }
 
 .importDialog {
@@ -1633,6 +1817,35 @@
 
   .cloudActionGrid {
     grid-template-columns: 1fr;
+  }
+
+  .colorDialog {
+    padding: 1rem;
+  }
+
+  .colorDialogHeader {
+    grid-template-columns: 48px 1fr;
+    gap: .7rem;
+  }
+
+  .colorDialogSwatch {
+    width: 48px;
+    height: 48px;
+    border-radius: 13px;
+  }
+
+  .colorDialogFields {
+    grid-template-columns: 1fr;
+  }
+
+  .colorDialogFields label,
+  .colorDialogFields label:first-child,
+  .newColorPicker {
+    grid-column: 1;
+  }
+
+  .colorDialogActions button {
+    flex: 1;
   }
 }
 

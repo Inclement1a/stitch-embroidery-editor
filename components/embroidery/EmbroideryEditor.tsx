@@ -123,7 +123,9 @@ const symbols = pattern.palette.map((item) => item.symbol);
 const symbolToIndex = new Map(symbols.map((symbol, index) => [symbol, index]));
 const storageKey = "stitch-studio-project-v6";
 const googleClientIdStorageKey = "stitch-studio-google-client-id";
-const defaultGoogleClientId = process.env.NEXT_PUBLIC_GOOGLE_CLIENT_ID ?? "";
+const defaultGoogleClientId =
+  process.env.NEXT_PUBLIC_GOOGLE_CLIENT_ID ??
+  "111374758065-3mponeoaib8mnqdo8qfba0t8nffo19om.apps.googleusercontent.com";
 
 function buildInitialCells() {
   return Uint8Array.from(

@@ -3,6 +3,9 @@
 import {
   Brush,
   Check,
+  Cloud,
+  CloudDownload,
+  CloudUpload,
   Download,
   Eye,
   EyeOff,
@@ -19,6 +22,7 @@ import {
   Redo2,
   RotateCcw,
   Save,
+  Settings2,
   Sparkles,
   SquareDashedMousePointer,
   Undo2,
@@ -26,6 +30,7 @@ import {
   ZoomIn,
   ZoomOut,
 } from "lucide-react";
+import Script from "next/script";
 import type {
   ChangeEvent,
   PointerEvent as ReactPointerEvent,
@@ -34,6 +39,13 @@ import type {
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import patternJson from "@/lib/embroidery/pattern.json";
+import {
+  downloadCloudProject,
+  findCloudProject,
+  GOOGLE_DRIVE_SCOPE,
+  GoogleDriveError,
+  uploadCloudProject,
+} from "@/lib/embroidery/googleDrive";
 
 import styles from "./EmbroideryEditor.module.css";
 
@@ -75,12 +87,43 @@ type RestoredProject = {
   cells: Uint8Array;
   done: Uint8Array;
   palette: PaletteItem[];
+  source: "file" | "cloud";
 };
+
+type GoogleTokenResponse = {
+  access_token?: string;
+  error?: string;
+  error_description?: string;
+};
+
+type GoogleTokenClient = {
+  requestAccessToken: (config?: { prompt?: string }) => void;
+};
+
+declare global {
+  interface Window {
+    google?: {
+      accounts: {
+        oauth2: {
+          initTokenClient: (config: {
+            client_id: string;
+            scope: string;
+            callback: (response: GoogleTokenResponse) => void;
+            error_callback?: (error: { type?: string }) => void;
+          }) => GoogleTokenClient;
+          revoke: (token: string, callback?: () => void) => void;
+        };
+      };
+    };
+  }
+}
 
 const pattern = patternJson as PatternData;
 const symbols = pattern.palette.map((item) => item.symbol);
 const symbolToIndex = new Map(symbols.map((symbol, index) => [symbol, index]));
 const storageKey = "stitch-studio-project-v6";
+const googleClientIdStorageKey = "stitch-studio-google-client-id";
+const defaultGoogleClientId = process.env.NEXT_PUBLIC_GOOGLE_CLIENT_ID ?? "";
 
 function buildInitialCells() {
   return Uint8Array.from(
@@ -130,6 +173,71 @@ function constrainView(view: EditorView, width: number, height: number): EditorV
   return { ...view, offsetX, offsetY };
 }
 
+function restoreImportedProject(
+  imported: ImportedProject,
+  filename: string,
+  source: RestoredProject["source"],
+): RestoredProject {
+  if (imported.width !== pattern.width || imported.height !== pattern.height) {
+    throw new Error(
+      `Ожидается схема ${pattern.width} × ${pattern.height} крестиков.`,
+    );
+  }
+  if (
+    !Array.isArray(imported.rows) ||
+    imported.rows.length !== pattern.height ||
+    imported.rows.some(
+      (row) => typeof row !== "string" || row.length !== pattern.width,
+    )
+  ) {
+    throw new Error("В файле повреждены или отсутствуют строки схемы.");
+  }
+
+  const encoded = (imported.rows as string[]).join("");
+  if ([...encoded].some((symbol) => !symbolToIndex.has(symbol as SymbolKey))) {
+    throw new Error("В схеме есть неизвестные обозначения цветов.");
+  }
+
+  if (
+    imported.completed !== undefined &&
+    (!Array.isArray(imported.completed) ||
+      imported.completed.some(
+        (index) =>
+          !Number.isInteger(index) ||
+          index < 0 ||
+          index >= pattern.width * pattern.height,
+      ))
+  ) {
+    throw new Error("Список выполненных крестиков повреждён.");
+  }
+
+  const nextCells = Uint8Array.from(
+    encoded,
+    (symbol) => symbolToIndex.get(symbol as SymbolKey) ?? 0,
+  );
+  const nextDone = new Uint8Array(pattern.width * pattern.height);
+  if (Array.isArray(imported.completed)) {
+    imported.completed.forEach((index) => {
+      nextDone[index as number] = 1;
+    });
+  }
+  const nextPalette = pattern.palette.map((item) => {
+    const saved = imported.palette?.find((entry) => entry.symbol === item.symbol);
+    const color = saved?.color;
+    return color && /^#[0-9a-f]{6}$/i.test(color)
+      ? { ...item, color: color.toUpperCase() }
+      : { ...item };
+  });
+
+  return {
+    filename,
+    cells: nextCells,
+    done: nextDone,
+    palette: nextPalette,
+    source,
+  };
+}
+
 export default function EmbroideryEditor() {
   const undoStack = useRef<Change[]>([]);
   const redoStack = useRef<Change[]>([]);
@@ -147,6 +255,9 @@ export default function EmbroideryEditor() {
   const editorViewport = useRef<HTMLDivElement>(null);
   const importInput = useRef<HTMLInputElement>(null);
   const viewInitialized = useRef(false);
+  const accessToken = useRef<string | null>(null);
+  const cloudSaveTimer = useRef<number | null>(null);
+  const lastCloudSnapshot = useRef<string | null>(null);
 
   const [cells, setCells] = useState<Uint8Array>(() => buildInitialCells());
   const [done, setDone] = useState<Uint8Array>(
@@ -177,6 +288,19 @@ export default function EmbroideryEditor() {
   const [isPanning, setIsPanning] = useState(false);
   const [areaSelection, setAreaSelection] = useState<AreaSelection | null>(null);
   const [pendingImport, setPendingImport] = useState<RestoredProject | null>(null);
+  const [cloudDialogOpen, setCloudDialogOpen] = useState(false);
+  const [googleScriptReady, setGoogleScriptReady] = useState(false);
+  const [googleClientId, setGoogleClientId] = useState(defaultGoogleClientId);
+  const [googleClientIdDraft, setGoogleClientIdDraft] = useState(
+    defaultGoogleClientId,
+  );
+  const [cloudConnected, setCloudConnected] = useState(false);
+  const [cloudAutoSave, setCloudAutoSave] = useState(false);
+  const [cloudBusy, setCloudBusy] = useState(false);
+  const [cloudStatus, setCloudStatus] = useState(
+    defaultGoogleClientId ? "Готов к подключению" : "Нужна настройка Google",
+  );
+  const [cloudLastSaved, setCloudLastSaved] = useState<string | null>(null);
 
   const fitScale = getFitScale(canvasSize.width, canvasSize.height);
   const zoomPercent = Math.round((editorView.scale / fitScale) * 100);
@@ -185,6 +309,76 @@ export default function EmbroideryEditor() {
     selectedSymbolRef.current = index;
     setSelectedSymbol(index);
   }, []);
+
+  useEffect(() => {
+    if (defaultGoogleClientId) return;
+    const savedClientId = window.localStorage.getItem(googleClientIdStorageKey);
+    if (!savedClientId) return;
+    setGoogleClientId(savedClientId);
+    setGoogleClientIdDraft(savedClientId);
+    setCloudStatus("Готов к подключению");
+  }, []);
+
+  const requestGoogleAccessToken = useCallback(
+    (selectAccount = false) =>
+      new Promise<string>((resolve, reject) => {
+        if (!googleClientId) {
+          reject(new Error("Сначала укажите OAuth Client ID приложения Google."));
+          return;
+        }
+        if (!googleScriptReady || !window.google) {
+          reject(new Error("Сервис Google ещё загружается. Попробуйте ещё раз."));
+          return;
+        }
+
+        const client = window.google.accounts.oauth2.initTokenClient({
+          client_id: googleClientId,
+          scope: GOOGLE_DRIVE_SCOPE,
+          callback: (response) => {
+            if (!response.access_token) {
+              reject(
+                new Error(
+                  response.error_description ||
+                    response.error ||
+                    "Google не выдал доступ к облаку.",
+                ),
+              );
+              return;
+            }
+            accessToken.current = response.access_token;
+            setCloudConnected(true);
+            setCloudStatus("Google Drive подключён");
+            resolve(response.access_token);
+          },
+          error_callback: (error) => {
+            reject(
+              new Error(
+                error.type === "popup_closed"
+                  ? "Окно входа Google было закрыто."
+                  : "Не удалось открыть вход Google.",
+              ),
+            );
+          },
+        });
+
+        client.requestAccessToken({ prompt: selectAccount ? "select_account" : "" });
+      }),
+    [googleClientId, googleScriptReady],
+  );
+
+  const saveGoogleClientId = () => {
+    const value = googleClientIdDraft.trim();
+    if (!/^[\w-]+\.apps\.googleusercontent\.com$/i.test(value)) {
+      setCloudStatus("Проверьте OAuth Client ID");
+      return;
+    }
+    window.localStorage.setItem(googleClientIdStorageKey, value);
+    accessToken.current = null;
+    setGoogleClientId(value);
+    setCloudConnected(false);
+    setCloudAutoSave(false);
+    setCloudStatus("Настройка сохранена — подключите Google Drive");
+  };
 
   const commit = useCallback((indices: number[], after: number[]) => {
     const current = cellsRef.current;
@@ -487,6 +681,158 @@ export default function EmbroideryEditor() {
     for (const cellDone of done) value += cellDone;
     return value;
   }, [done]);
+
+  const serializeProject = useCallback(() => {
+    const encoded = encodeCells(cellsRef.current);
+    const rows = Array.from({ length: pattern.height }, (_, row) =>
+      encoded.slice(row * pattern.width, (row + 1) * pattern.width),
+    );
+    return JSON.stringify(
+      {
+        version: 1,
+        title: pattern.title,
+        width: pattern.width,
+        height: pattern.height,
+        sectorSize: pattern.sectorSize,
+        palette: palette.map((item, index) => ({ ...item, count: counts[index] })),
+        rows,
+        completed: Array.from(doneRef.current, (value, index) =>
+          value ? index : -1,
+        ).filter((index) => index >= 0),
+      },
+      null,
+      2,
+    );
+  }, [counts, palette]);
+
+  const handleCloudError = useCallback((error: unknown) => {
+    const message =
+      error instanceof Error ? error.message : "Неизвестная ошибка Google Drive.";
+    if (error instanceof GoogleDriveError && error.status === 401) {
+      accessToken.current = null;
+      setCloudConnected(false);
+      setCloudAutoSave(false);
+      setCloudStatus("Сеанс Google истёк — подключитесь снова");
+      return;
+    }
+    setCloudStatus(message);
+  }, []);
+
+  const connectGoogleDrive = useCallback(async () => {
+    setCloudBusy(true);
+    setCloudStatus("Подключаем Google Drive…");
+    try {
+      const token = await requestGoogleAccessToken(true);
+      const cloudFile = await findCloudProject(token);
+      setCloudStatus(
+        cloudFile
+          ? "Подключено — в облаке найдена сохранённая схема"
+          : "Подключено — облачная копия ещё не создана",
+      );
+    } catch (error) {
+      handleCloudError(error);
+    } finally {
+      setCloudBusy(false);
+    }
+  }, [handleCloudError, requestGoogleAccessToken]);
+
+  const saveToGoogleDrive = useCallback(
+    async (interactive = true) => {
+      const snapshot = serializeProject();
+      if (!interactive && snapshot === lastCloudSnapshot.current) return;
+      setCloudBusy(true);
+      setCloudStatus("Сохраняем в Google Drive…");
+      try {
+        const token =
+          accessToken.current ??
+          (interactive ? await requestGoogleAccessToken(true) : null);
+        if (!token) return;
+        const saved = await uploadCloudProject(token, snapshot);
+        lastCloudSnapshot.current = snapshot;
+        setCloudConnected(true);
+        setCloudAutoSave(true);
+        setCloudLastSaved(
+          new Date(saved.modifiedTime ?? Date.now()).toLocaleString("ru-RU", {
+            dateStyle: "short",
+            timeStyle: "short",
+          }),
+        );
+        setCloudStatus("Сохранено в Google Drive · автосинхронизация включена");
+        setSaveLabel("Сохранено локально и в Drive");
+      } catch (error) {
+        handleCloudError(error);
+      } finally {
+        setCloudBusy(false);
+      }
+    },
+    [handleCloudError, requestGoogleAccessToken, serializeProject],
+  );
+
+  const loadFromGoogleDrive = useCallback(async () => {
+    setCloudBusy(true);
+    setCloudStatus("Загружаем облачную копию…");
+    try {
+      const token =
+        accessToken.current ?? (await requestGoogleAccessToken(true));
+      const cloudFile = await findCloudProject(token);
+      if (!cloudFile) {
+        setCloudStatus("В Google Drive пока нет сохранённой схемы");
+        return;
+      }
+      const json = await downloadCloudProject(token, cloudFile.id);
+      const restored = restoreImportedProject(
+        JSON.parse(json) as ImportedProject,
+        `Google Drive · ${new Date(cloudFile.modifiedTime ?? Date.now()).toLocaleString("ru-RU")}`,
+        "cloud",
+      );
+      lastCloudSnapshot.current = json;
+      setPendingImport(restored);
+      setCloudStatus("Облачная копия готова к загрузке");
+      setCloudDialogOpen(false);
+    } catch (error) {
+      handleCloudError(error);
+    } finally {
+      setCloudBusy(false);
+    }
+  }, [handleCloudError, requestGoogleAccessToken]);
+
+  const disconnectGoogleDrive = () => {
+    const token = accessToken.current;
+    if (token && window.google) {
+      window.google.accounts.oauth2.revoke(token);
+    }
+    accessToken.current = null;
+    lastCloudSnapshot.current = null;
+    setCloudConnected(false);
+    setCloudAutoSave(false);
+    setCloudLastSaved(null);
+    setCloudStatus("Google Drive отключён");
+  };
+
+  useEffect(() => {
+    if (!hydrated || !cloudConnected || !cloudAutoSave || !accessToken.current) {
+      return;
+    }
+    const snapshot = serializeProject();
+    if (snapshot === lastCloudSnapshot.current) return;
+    setCloudStatus("Есть изменения — скоро сохраним в Drive");
+    if (cloudSaveTimer.current) window.clearTimeout(cloudSaveTimer.current);
+    cloudSaveTimer.current = window.setTimeout(() => {
+      void saveToGoogleDrive(false);
+    }, 1600);
+    return () => {
+      if (cloudSaveTimer.current) window.clearTimeout(cloudSaveTimer.current);
+    };
+  }, [
+    cells,
+    cloudAutoSave,
+    cloudConnected,
+    done,
+    hydrated,
+    palette,
+    saveToGoogleDrive,
+    serializeProject,
+  ]);
 
   const visibleRange = useMemo(() => {
     if (!canvasSize.width || !canvasSize.height) {
@@ -839,33 +1185,9 @@ export default function EmbroideryEditor() {
   };
 
   const exportJson = () => {
-    const encoded = encodeCells(cellsRef.current);
-    const rows = Array.from({ length: pattern.height }, (_, row) =>
-      encoded.slice(row * pattern.width, (row + 1) * pattern.width),
-    );
     downloadBlob(
       "embroidery-pattern.json",
-      new Blob(
-        [
-          JSON.stringify(
-            {
-              version: 1,
-              title: pattern.title,
-              width: pattern.width,
-              height: pattern.height,
-              sectorSize: pattern.sectorSize,
-              palette: palette.map((item, index) => ({ ...item, count: counts[index] })),
-              rows,
-              completed: Array.from(doneRef.current, (value, index) =>
-                value ? index : -1,
-              ).filter((index) => index >= 0),
-            },
-            null,
-            2,
-          ),
-        ],
-        { type: "application/json" },
-      ),
+      new Blob([serializeProject()], { type: "application/json" }),
     );
   };
 
@@ -877,61 +1199,7 @@ export default function EmbroideryEditor() {
 
     try {
       const imported = JSON.parse(await file.text()) as ImportedProject;
-      if (imported.width !== pattern.width || imported.height !== pattern.height) {
-        throw new Error(
-          `Ожидается схема ${pattern.width} × ${pattern.height} крестиков.`,
-        );
-      }
-      if (
-        !Array.isArray(imported.rows) ||
-        imported.rows.length !== pattern.height ||
-        imported.rows.some(
-          (row) => typeof row !== "string" || row.length !== pattern.width,
-        )
-      ) {
-        throw new Error("В файле повреждены или отсутствуют строки схемы.");
-      }
-
-      const encoded = (imported.rows as string[]).join("");
-      if ([...encoded].some((symbol) => !symbolToIndex.has(symbol as SymbolKey))) {
-        throw new Error("В схеме есть неизвестные обозначения цветов.");
-      }
-
-      if (
-        imported.completed !== undefined &&
-        (!Array.isArray(imported.completed) ||
-          imported.completed.some(
-            (index) =>
-              !Number.isInteger(index) || index < 0 || index >= pattern.width * pattern.height,
-          ))
-      ) {
-        throw new Error("Список выполненных крестиков повреждён.");
-      }
-
-      const nextCells = Uint8Array.from(
-        encoded,
-        (symbol) => symbolToIndex.get(symbol as SymbolKey) ?? 0,
-      );
-      const nextDone = new Uint8Array(pattern.width * pattern.height);
-      if (Array.isArray(imported.completed)) {
-        imported.completed.forEach((index) => {
-          nextDone[index as number] = 1;
-        });
-      }
-      const nextPalette = pattern.palette.map((item) => {
-        const saved = imported.palette?.find((entry) => entry.symbol === item.symbol);
-        const color = saved?.color;
-        return color && /^#[0-9a-f]{6}$/i.test(color)
-          ? { ...item, color: color.toUpperCase() }
-          : { ...item };
-      });
-
-      setPendingImport({
-        filename: file.name,
-        cells: nextCells,
-        done: nextDone,
-        palette: nextPalette,
-      });
+      setPendingImport(restoreImportedProject(imported, file.name, "file"));
     } catch (error) {
       const message = error instanceof Error ? error.message : "Неизвестная ошибка файла.";
       setSaveLabel("Ошибка загрузки");
@@ -951,8 +1219,15 @@ export default function EmbroideryEditor() {
     redoStack.current = [];
     setHistoryCounts({ undo: 0, redo: 0 });
     setTool("pan");
+    if (pendingImport.source === "cloud") {
+      setCloudConnected(true);
+      setCloudAutoSave(true);
+      setCloudLastSaved(new Date().toLocaleString("ru-RU"));
+      setCloudStatus("Загружено из Drive · автосинхронизация включена");
+      setSaveLabel("Загружено из Google Drive");
+    }
     setPendingImport(null);
-    setSaveLabel("Проект загружен");
+    if (pendingImport.source === "file") setSaveLabel("Проект загружен");
     fitEditor();
   };
 
@@ -982,7 +1257,14 @@ export default function EmbroideryEditor() {
   };
 
   return (
-    <main className={styles.page}>
+    <>
+      <Script
+        src="https://accounts.google.com/gsi/client"
+        strategy="afterInteractive"
+        onReady={() => setGoogleScriptReady(true)}
+        onError={() => setCloudStatus("Не удалось загрузить сервис Google")}
+      />
+      <main className={styles.page}>
       <header className={styles.topbar}>
         <div className={styles.brand}>
           <span className={styles.brandMark} aria-hidden="true"><Grid3X3 /></span>
@@ -1010,6 +1292,13 @@ export default function EmbroideryEditor() {
             <Upload /> Загрузить
           </button>
           <button className={styles.headerButton} onClick={exportJson} type="button"><FileJson /> Сохранить</button>
+          <button
+            className={`${styles.headerButton} ${cloudConnected ? styles.cloudButtonActive : ""}`}
+            onClick={() => setCloudDialogOpen(true)}
+            type="button"
+          >
+            <Cloud /> Облако
+          </button>
           <button className={styles.headerButtonPrimary} onClick={exportPng} type="button"><Download /> PNG</button>
         </div>
       </header>
@@ -1191,6 +1480,138 @@ export default function EmbroideryEditor() {
           </section>
         </div>
       )}
-    </main>
+
+      {cloudDialogOpen && (
+        <div className={styles.importOverlay}>
+          <section
+            className={styles.cloudDialog}
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="cloud-dialog-title"
+          >
+            <header className={styles.cloudDialogHeader}>
+              <span className={styles.cloudDialogIcon} aria-hidden="true"><Cloud /></span>
+              <div>
+                <small>Облачное сохранение</small>
+                <h2 id="cloud-dialog-title">Google Drive</h2>
+                <p>Одна приватная копия схемы в скрытой папке данных приложения.</p>
+              </div>
+              <button
+                className={styles.cloudCloseButton}
+                onClick={() => setCloudDialogOpen(false)}
+                type="button"
+                aria-label="Закрыть"
+              >
+                ×
+              </button>
+            </header>
+
+            <div className={`${styles.cloudStatus} ${cloudConnected ? styles.cloudStatusConnected : ""}`}>
+              <span><Cloud /></span>
+              <p>
+                <strong>{cloudStatus}</strong>
+                <small>
+                  {cloudLastSaved
+                    ? `Последняя запись: ${cloudLastSaved}`
+                    : cloudAutoSave
+                      ? "Автосинхронизация включена"
+                      : "Локальное сохранение продолжает работать всегда"}
+                </small>
+              </p>
+            </div>
+
+            {!googleClientId ? (
+              <div className={styles.cloudSetup}>
+                <p>
+                  Для личного Drive нужен бесплатный OAuth Client ID. Он не является
+                  паролем и не даёт сайту доступ без вашего подтверждения Google.
+                </p>
+                <ol>
+                  <li>В Google Cloud включите Drive API.</li>
+                  <li>Создайте OAuth Client ID типа «Web application».</li>
+                  <li>Добавьте источник <code>https://inclement1a.github.io</code>.</li>
+                </ol>
+                <a
+                  href="https://console.cloud.google.com/apis/credentials"
+                  target="_blank"
+                  rel="noreferrer"
+                >
+                  Открыть Google Cloud Console ↗
+                </a>
+                <label>
+                  <span>OAuth Client ID</span>
+                  <input
+                    value={googleClientIdDraft}
+                    onChange={(event) => setGoogleClientIdDraft(event.target.value)}
+                    placeholder="…apps.googleusercontent.com"
+                    autoComplete="off"
+                  />
+                </label>
+                <button className={styles.cloudPrimaryButton} onClick={saveGoogleClientId} type="button">
+                  <Settings2 /> Сохранить настройку
+                </button>
+              </div>
+            ) : (
+              <div className={styles.cloudControls}>
+                {!cloudConnected ? (
+                  <button
+                    className={styles.cloudPrimaryButton}
+                    onClick={() => void connectGoogleDrive()}
+                    disabled={cloudBusy || !googleScriptReady}
+                    type="button"
+                  >
+                    <Cloud /> {googleScriptReady ? "Подключить Google Drive" : "Загружаем Google…"}
+                  </button>
+                ) : (
+                  <div className={styles.cloudActionGrid}>
+                    <button
+                      onClick={() => void loadFromGoogleDrive()}
+                      disabled={cloudBusy}
+                      type="button"
+                    >
+                      <CloudDownload /> Загрузить из Drive
+                    </button>
+                    <button
+                      className={styles.cloudPrimaryButton}
+                      onClick={() => void saveToGoogleDrive()}
+                      disabled={cloudBusy}
+                      type="button"
+                    >
+                      <CloudUpload /> Сохранить в Drive
+                    </button>
+                  </div>
+                )}
+
+                <div className={styles.cloudPrivacyNote}>
+                  <strong>Доступ ограничен</strong>
+                  <p>Сайт видит только собственную скрытую копию. Остальные файлы Google Drive недоступны.</p>
+                </div>
+
+                <details className={styles.cloudAdvanced}>
+                  <summary>Настройка подключения</summary>
+                  <label>
+                    <span>OAuth Client ID</span>
+                    <input
+                      value={googleClientIdDraft}
+                      onChange={(event) => setGoogleClientIdDraft(event.target.value)}
+                      autoComplete="off"
+                    />
+                  </label>
+                  <div>
+                    {!defaultGoogleClientId && (
+                      <button onClick={saveGoogleClientId} type="button"><Settings2 /> Обновить ID</button>
+                    )}
+                    {cloudConnected && (
+                      <button onClick={disconnectGoogleDrive} type="button">Отключить Drive</button>
+                    )}
+                  </div>
+                </details>
+              </div>
+            )}
+          </section>
+        </div>
+      )}
+      </main>
+    </>
   );
 }
